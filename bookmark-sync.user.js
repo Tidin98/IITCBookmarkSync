@@ -10,10 +10,16 @@
 // @homepageURL    https://github.com/Tidin98/IITCBookmarkSync
 // @depends        bookmarks@ZasoGD
 // @match          https://intel.ingress.com/*
-// @grant          none
+// @grant          GM_xmlhttpRequest
+// @grant          unsafeWindow
+// @connect        script.google.com
+// @connect        script.googleusercontent.com
 // ==/UserScript==
 
-function wrapper(plugin_info) {
+function wrapper(plugin_info, page) {
+  var window = page;
+  var document = page.document;
+  var $ = page.jQuery || page.$;
   if (typeof window.plugin !== 'function') window.plugin = function () {};
 
   var self = window.plugin.bookmarkSync = function () {};
@@ -63,11 +69,52 @@ function wrapper(plugin_info) {
   };
 
   // --- Cloud Communication ---
-  self.getCloudData = function (callback, errorCallback) {
-    $.ajax({
+  self.requestCloud = function (options) {
+    GM_xmlhttpRequest({
+      method: options.method,
       url: self.settings.scriptURL,
-      type: 'GET',
-      dataType: 'text',
+      headers: options.headers || {},
+      data: options.data,
+      onload: function (response) {
+        if (response.status < 200 || response.status >= 300) {
+          options.error(response.status, self.describeResponse(response, response.responseText));
+          return;
+        }
+        options.success(response.responseText);
+      },
+      onerror: function (response) {
+        options.error(response.status || 0, self.describeResponse(response, 'Network request failed'));
+      },
+      ontimeout: function () {
+        options.error(0, 'Request timed out');
+      }
+    });
+  };
+
+  self.describeResponse = function (response, fallback) {
+    var details = [];
+    if (response.finalUrl) details.push('URL: ' + response.finalUrl);
+    if (response.statusText) details.push('Status: ' + response.statusText);
+    if (response.responseHeaders) details.push('Headers: ' + String(response.responseHeaders).slice(0, 500));
+    if (response.responseText) details.push('Body: ' + String(response.responseText).slice(0, 300));
+    return details.length ? details.join('\n') : fallback;
+  };
+
+  self.jsonEqual = function (left, right) {
+    if (left === right) return true;
+    if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+    var leftKeys = Object.keys(left).sort();
+    var rightKeys = Object.keys(right).sort();
+    if (leftKeys.length !== rightKeys.length) return false;
+    for (var i = 0; i < leftKeys.length; i++) {
+      if (leftKeys[i] !== rightKeys[i] || !self.jsonEqual(left[leftKeys[i]], right[rightKeys[i]])) return false;
+    }
+    return true;
+  };
+
+  self.getCloudData = function (callback, errorCallback) {
+    self.requestCloud({
+      method: 'GET',
       success: function (data) {
         try {
           var parsed = JSON.parse(data);
@@ -76,41 +123,60 @@ function wrapper(plugin_info) {
           errorCallback('Failed to parse cloud data.');
         }
       },
-      error: function () {
+      error: function (statusCode, detail) {
         errorCallback(
           'Bookmark Sync: Failed to retrieve data from the script URL.\n' +
-          'Verify that you are using the right URL and that no extension is blocking access to Google.'
+          'Request status: ' + (statusCode || 'network error') + '\n' +
+          (detail ? 'Details: ' + String(detail).slice(0, 300) + '\n' : '') +
+          'Check that the Web App is deployed with access set to Anyone.'
         );
       }
     });
   };
 
   self.uploadToCloud = function (data, callback, errorCallback) {
-    var formData = new FormData();
-    formData.append('data', data);
-    $.ajax({
-      url: self.settings.scriptURL,
-      type: 'POST',
-      data: formData,
-      processData: false,
-      contentType: false,
+    self.requestCloud({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      data: 'data=' + encodeURIComponent(data),
       success: function (response) {
+        // Apps Script may redirect POST responses to googleusercontent and
+        // return an empty body. Confirm the write with a fresh GET instead.
         try {
           var result = JSON.parse(response);
-          if (result.status === 'ok') {
+          if (result && result.status && result.status !== 'ok') {
+            errorCallback('Apps Script returned an error: ' + (result.message || 'unknown'));
+            return;
+          }
+        } catch (e) { /* Verify via GET; redirected responses may have no body. */ }
+
+        self.getCloudData(function (cloudData) {
+          var expectedData;
+          try {
+            expectedData = JSON.parse(data);
+          } catch (e) {
+            errorCallback('Could not verify uploaded data: local data is invalid JSON.');
+            return;
+          }
+          if (self.jsonEqual(cloudData, expectedData)) {
             callback();
           } else {
-            errorCallback('Server error: ' + (result.message || 'unknown'));
+            var cloudCount = self.countItems(cloudData);
+            var expectedCount = self.countItems(expectedData);
+            errorCallback(
+              'Upload could not be verified. Local: ' + expectedCount.portals + ' portals, ' + expectedCount.maps + ' maps. ' +
+              'Cloud: ' + cloudCount.portals + ' portals, ' + cloudCount.maps + ' maps. ' +
+              'Update Code.gs in Apps Script and deploy a new version.'
+            );
           }
-        } catch (e) {
-          // Some deployments return non-JSON on success
-          callback();
-        }
+        }, errorCallback);
       },
-      error: function () {
+      error: function (statusCode, detail) {
         errorCallback(
           'Bookmark Sync: Failed to send data to the script URL.\n' +
-          'Verify that you are using the right URL and that no extension is blocking access to Google.'
+          'Request status: ' + (statusCode || 'network error') + '\n' +
+          (detail ? 'Details: ' + String(detail).slice(0, 1000) + '\n' : '') +
+          'Check that the Web App is deployed with access set to Anyone.'
         );
       }
     });
@@ -434,7 +500,7 @@ function wrapper(plugin_info) {
   window.bootPlugins.push(setup);
 }
 
-// --- Script Injection ---
+// --- IITC integration ---
 var info = {};
 if (typeof GM_info !== 'undefined' && GM_info && GM_info.script) {
   info.script = {
@@ -443,8 +509,4 @@ if (typeof GM_info !== 'undefined' && GM_info && GM_info.script) {
     description: GM_info.script.description
   };
 }
-var script = document.createElement('script');
-script.appendChild(
-  document.createTextNode('(' + wrapper + ')(' + JSON.stringify(info) + ');')
-);
-(document.body || document.head || document.documentElement).appendChild(script);
+wrapper(info, typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);

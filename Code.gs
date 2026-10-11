@@ -21,15 +21,14 @@ function doGet(e) {
   if (lastRow < 2) {
     result = { maps: {}, portals: {} };
   } else {
-    var data = sheet.getRange(2, 2).getValue();
+    var data = sheet.getRange(2, 2).getDisplayValue();
     try {
       result = JSON.parse(data);
     } catch (err) {
-      result = { maps: {}, portals: {} };
+      return jsonOutput_({ status: 'error', message: 'stored bookmark data is invalid JSON' });
     }
   }
-  return ContentService.createTextOutput(JSON.stringify(result))
-    .setMimeType(ContentService.MimeType.JSON);
+  return jsonOutput_(result);
 }
 
 function doPost(e) {
@@ -47,11 +46,16 @@ function doPost(e) {
   var sheet = getOrCreateSheet_();
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) {
-    sheet.appendRow([new Date().toISOString(), data]);
+    sheet.getRange(2, 1, 1, 2).setNumberFormat('@').setValues([[new Date().toISOString(), data]]);
   } else {
-    sheet.getRange(2, 1, 1, 2).setValues([[new Date().toISOString(), data]]);
+    sheet.getRange(2, 1, 1, 2).setNumberFormat('@').setValues([[new Date().toISOString(), data]]);
   }
-  return ContentService.createTextOutput(JSON.stringify({ status: 'ok' }))
+  SpreadsheetApp.flush();
+  return jsonOutput_({ status: 'ok' });
+}
+
+function jsonOutput_(data) {
+  return ContentService.createTextOutput(JSON.stringify(data))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
