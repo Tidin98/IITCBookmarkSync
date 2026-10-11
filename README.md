@@ -31,7 +31,7 @@ IITC 插件，将 Bookmarks 插件的 portal/map 书签数据同步到 Google Sh
 
 1. 点击 **部署 → 新建部署**
 2. 类型选择 **Web 应用**
-3. "谁有权访问" 设为 **任何人**
+3. "执行身份" 设为 **我**，"谁有权访问" 设为 **任何人**
 4. 点击部署，复制生成的 Web 应用 URL
 
 ### 4. 配置插件
@@ -53,3 +53,16 @@ IITC 插件，将 Bookmarks 插件的 portal/map 书签数据同步到 Google Sh
 |------|------|
 | `bookmark-sync.user.js` | IITC 用户脚本插件 |
 | `Code.gs` | Google Apps Script 后端，部署到 Google Sheet |
+
+## 升级后端
+
+新版将大于 50,000 字符的书签 JSON 分块保存到 `Bookmarks` 工作表的 B2、B3 等单元格，并兼容原来的 B2 单元格数据。上传只有收到后端确认且重新读取的数据一致时才会显示成功。
+
+1. 用新版 `Code.gs` 替换 Apps Script 中的内容并保存。
+2. 运行一次 `initialSetup` 绑定目标表格并授权；新版初始化会保留已有书签。
+3. 在 **部署 → 管理部署 → 编辑 → 版本：新版本 → 部署** 更新现有 Web 应用，保留原 `/exec` URL。只保存代码不会更新已部署版本。执行身份选 **我**，访问权限选 **任何人**。
+4. 更新用户脚本到 0.2.0，刷新 IITC 页面。请勿将重定向后的 `script.googleusercontent.com/macros/echo` 地址填入设置。
+
+## 验证
+
+运行 `node --test tests/sync.test.cjs` 验证大数据分块、删除书签后的覆盖、Google 重定向错误和上传完成判定。

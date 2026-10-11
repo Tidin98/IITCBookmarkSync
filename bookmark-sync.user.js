@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           IITC plugin: Bookmark Sync
 // @category       Controls
-// @version        0.1.0
+// @version        0.2.0
 // @description    Sync IITC portal/map bookmarks to/from a Google Sheet
 // @id             bookmark-sync@Tidin98
 // @namespace      https://github.com/Tidin98/IITCBookmarkSync
@@ -25,6 +25,12 @@ function wrapper(plugin_info, page) {
   var self = window.plugin.bookmarkSync = function () {};
   self.id = 'bookmarkSync';
   self.title = 'Bookmark Sync';
+  self.status = '';
+
+  self.setStatus = function (text) {
+    self.status = text;
+    $('#bookmark-sync-status').text(text);
+  };
 
   // --- Constants ---
   var KEY_SETTINGS = 'plugin-bookmark-sync-settings';
@@ -70,39 +76,94 @@ function wrapper(plugin_info, page) {
 
   // --- Cloud Communication ---
   self.requestCloud = function (options) {
-    GM_xmlhttpRequest({
-      method: options.method,
-      url: self.settings.scriptURL,
-      headers: options.headers || {},
-      data: options.data,
-      onload: function (response) {
-        if (response.status < 200 || response.status >= 300) {
-          options.error(response.status, self.describeResponse(response, response.responseText));
-          return;
-        }
-        options.success(response.responseText);
-      },
-      onerror: function (response) {
-        options.error(response.status || 0, self.describeResponse(response, 'Network request failed'));
-      },
-      ontimeout: function () {
-        options.error(0, 'Request timed out');
+    var settled = false;
+    var request;
+    var timer = setTimeout(function () {
+      if (settled) return;
+      finish(false, 0, 'Google request timed out after 45 seconds.');
+      if (request && request.abort) request.abort();
+    }, 45000);
+
+    function finish(success, value, detail) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (success) options.success(value);
+      else {
+        self.setStatus('请求失败');
+        options.error(value, detail);
       }
-    });
+    }
+
+    function send(url, method, redirected, retry) {
+      try {
+        request = GM_xmlhttpRequest({
+          method: method,
+          url: url,
+          // Fetch changes POST to GET on Google's 302 response.
+          fetch: true,
+          nocache: true,
+          headers: method === 'POST' ? options.headers : {},
+          data: method === 'POST' ? options.data : undefined,
+          onload: function (response) {
+            if (settled) return;
+            var finalURL;
+            try { finalURL = new URL(response.finalUrl || url); } catch (e) { /* Report below. */ }
+            if (method === 'POST' && !redirected && response.status === 405 && finalURL &&
+                finalURL.origin === 'https://script.googleusercontent.com' && finalURL.pathname === '/macros/echo') {
+              // Older managers may keep POST on the redirect. Retrieve its
+              // result with GET; do not issue the write a second time.
+              send(finalURL.href, 'GET', true, retry);
+              return;
+            }
+            if (options.method === 'GET' && response.status === 404 && retry === 0) {
+              send(freshURL(), 'GET', false, 1);
+              return;
+            }
+            if (response.status < 200 || response.status >= 300) {
+              finish(false, response.status, self.describeResponse(response, 'Google returned an HTTP error.'));
+              return;
+            }
+            finish(true, response.responseText || '');
+          },
+          onerror: function (response) {
+            finish(false, response.status || 0, self.describeResponse(response, 'Network request failed'));
+          },
+          ontimeout: function () { finish(false, 0, 'Google request timed out.'); },
+          onabort: function () { finish(false, 0, 'Google request was aborted.'); }
+        });
+      } catch (e) {
+        finish(false, 0, 'Could not start the Google request: ' + e.message);
+      }
+    }
+
+    function freshURL() {
+      var url = new URL(self.settings.scriptURL);
+      url.searchParams.set('_bookmarkSync', Date.now() + '-' + Math.random().toString(36).slice(2));
+      return url.href;
+    }
+
+    try { send(freshURL(), options.method, false, 0); }
+    catch (e) { finish(false, 0, 'Invalid Apps Script URL: ' + e.message); }
   };
 
   self.describeResponse = function (response, fallback) {
     var details = [];
-    if (response.finalUrl) details.push('URL: ' + response.finalUrl);
+    if (response.finalUrl) {
+      try { var url = new URL(response.finalUrl); details.push('URL: ' + url.origin + url.pathname); }
+      catch (e) { /* Do not expose temporary Google keys. */ }
+    }
     if (response.statusText) details.push('Status: ' + response.statusText);
-    if (response.responseHeaders) details.push('Headers: ' + String(response.responseHeaders).slice(0, 500));
+    if (response.responseHeaders) details.push('Headers: ' + String(response.responseHeaders)
+      .split(/\r?\n/).filter(function (line) { return !/^location:/i.test(line); }).join('\n').slice(0, 500));
     if (response.responseText) details.push('Body: ' + String(response.responseText).slice(0, 300));
     return details.length ? details.join('\n') : fallback;
   };
 
   self.jsonEqual = function (left, right) {
     if (left === right) return true;
-    if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+    if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
+    if (Array.isArray(left) !== Array.isArray(right)) return false;
     var leftKeys = Object.keys(left).sort();
     var rightKeys = Object.keys(right).sort();
     if (leftKeys.length !== rightKeys.length) return false;
@@ -113,15 +174,27 @@ function wrapper(plugin_info, page) {
   };
 
   self.getCloudData = function (callback, errorCallback) {
+    self.setStatus('正在读取云端书签…');
     self.requestCloud({
       method: 'GET',
       success: function (data) {
-        try {
-          var parsed = JSON.parse(data);
-          callback(parsed);
-        } catch (e) {
-          errorCallback('Failed to parse cloud data.');
+        var parsed;
+        try { parsed = JSON.parse(data); }
+        catch (e) {
+          errorCallback('Apps Script returned invalid bookmark JSON. Response: ' +
+            (String(data).replace(/<[^>]*>/g, ' ').slice(-500) || '(empty)'));
+          return;
         }
+        if (parsed && parsed.status === 'error') {
+          errorCallback('Apps Script returned an error: ' + parsed.message);
+          return;
+        }
+        if (!parsed || !parsed.portals || !parsed.maps) {
+          errorCallback('Apps Script returned an unexpected bookmark format.');
+          return;
+        }
+        self.setStatus('云端书签已读取');
+        callback(parsed);
       },
       error: function (statusCode, detail) {
         errorCallback(
@@ -135,41 +208,24 @@ function wrapper(plugin_info, page) {
   };
 
   self.uploadToCloud = function (data, callback, errorCallback) {
+    self.setStatus('正在上传书签…');
     self.requestCloud({
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
       data: 'data=' + encodeURIComponent(data),
       success: function (response) {
-        // Apps Script may redirect POST responses to googleusercontent and
-        // return an empty body. Confirm the write with a fresh GET instead.
-        try {
-          var result = JSON.parse(response);
-          if (result && result.status && result.status !== 'ok') {
-            errorCallback('Apps Script returned an error: ' + (result.message || 'unknown'));
-            return;
-          }
-        } catch (e) { /* Verify via GET; redirected responses may have no body. */ }
-
-        self.getCloudData(function (cloudData) {
-          var expectedData;
-          try {
-            expectedData = JSON.parse(data);
-          } catch (e) {
-            errorCallback('Could not verify uploaded data: local data is invalid JSON.');
-            return;
-          }
-          if (self.jsonEqual(cloudData, expectedData)) {
-            callback();
-          } else {
-            var cloudCount = self.countItems(cloudData);
-            var expectedCount = self.countItems(expectedData);
-            errorCallback(
-              'Upload could not be verified. Local: ' + expectedCount.portals + ' portals, ' + expectedCount.maps + ' maps. ' +
-              'Cloud: ' + cloudCount.portals + ' portals, ' + cloudCount.maps + ' maps. ' +
-              'Update Code.gs in Apps Script and deploy a new version.'
-            );
-          }
-        }, errorCallback);
+        var result;
+        try { result = JSON.parse(response); }
+        catch (e) {
+          errorCallback('Apps Script did not confirm the write. Response: ' +
+            (String(response).replace(/<[^>]*>/g, ' ').slice(-500) || '(empty)'));
+          return;
+        }
+        if (!result || result.status !== 'ok') {
+          errorCallback('Apps Script returned an error: ' + (result && result.message || 'unexpected JSON response'));
+          return;
+        }
+        self.verifyUpload(data, callback, errorCallback);
       },
       error: function (statusCode, detail) {
         errorCallback(
@@ -180,6 +236,31 @@ function wrapper(plugin_info, page) {
         );
       }
     });
+  };
+
+  self.verifyUpload = function (data, callback, errorCallback) {
+    self.getCloudData(function (cloudData) {
+      var expectedData;
+      try {
+        expectedData = JSON.parse(data);
+      } catch (e) {
+        errorCallback('Could not verify uploaded data: local data is invalid JSON.');
+        return;
+      }
+      if (self.jsonEqual(cloudData, expectedData)) {
+        self.setStatus('上传完成，云端数据已核实');
+        callback();
+        return;
+      }
+      var cloudCount = self.countItems(cloudData);
+      var expectedCount = self.countItems(expectedData);
+      var difference = self.findPortalDifference(expectedData, cloudData);
+      self.setStatus('上传未通过验证');
+      errorCallback(
+        'Upload was not applied. Local: ' + expectedCount.portals + ' portals. Cloud: ' + cloudCount.portals + ' portals. ' +
+        (difference || 'Cloud data does not match the upload.')
+      );
+    }, errorCallback);
   };
 
   // --- Diff Computation ---
@@ -268,6 +349,18 @@ function wrapper(plugin_info, page) {
     return { portals: portals, maps: maps };
   };
 
+  self.findPortalDifference = function (expected, actual) {
+    var expectedPortals = self.flattenPortals(expected);
+    var actualPortals = self.flattenPortals(actual);
+    for (var guid in actualPortals) {
+      if (!expectedPortals[guid]) return 'Cloud has extra portal GUID: ' + guid + '.';
+    }
+    for (var guid in expectedPortals) {
+      if (!actualPortals[guid]) return 'Cloud is missing portal GUID: ' + guid + '.';
+    }
+    return '';
+  };
+
   self.escapeHtml = function (text) {
     var div = document.createElement('div');
     div.appendChild(document.createTextNode(text));
@@ -322,7 +415,7 @@ function wrapper(plugin_info, page) {
       return;
     }
 
-    var localData = window.plugin.bookmarks.bkmrksObj;
+    var localData = JSON.parse(JSON.stringify(window.plugin.bookmarks.bkmrksObj));
     var localCount = self.countItems(localData);
 
     self.getCloudData(function (cloudData) {
@@ -367,7 +460,7 @@ function wrapper(plugin_info, page) {
       return;
     }
 
-    var localData = window.plugin.bookmarks.bkmrksObj;
+    var localData = JSON.parse(JSON.stringify(window.plugin.bookmarks.bkmrksObj));
     var localCount = self.countItems(localData);
 
     self.getCloudData(function (cloudData) {
@@ -418,6 +511,7 @@ function wrapper(plugin_info, page) {
       + '<button id="bookmark-sync-save" style="margin-right:8px;">保存 URL</button>'
       + '</div>'
       + '<hr style="border-color:#444;margin:12px 0;" />'
+      + '<p id="bookmark-sync-status" role="status">' + self.escapeHtml(self.status) + '</p>'
       + '<div style="margin-top:8px;">'
       + '<button id="bookmark-sync-upload" style="margin-right:8px;padding:6px 12px;">上传到云端（覆盖）</button>'
       + '<button id="bookmark-sync-download" style="padding:6px 12px;">从云端下载（覆盖）</button>'
@@ -458,7 +552,6 @@ function wrapper(plugin_info, page) {
           self.settings.scriptURL = url;
           self.saveSettings();
         }
-        $('#bookmark-sync-dialog-main').dialog('close');
         self.doUpload();
       });
 
@@ -468,7 +561,6 @@ function wrapper(plugin_info, page) {
           self.settings.scriptURL = url;
           self.saveSettings();
         }
-        $('#bookmark-sync-dialog-main').dialog('close');
         self.doDownload();
       });
     }, 100);
@@ -489,7 +581,7 @@ function wrapper(plugin_info, page) {
 
     $('<style>').text(css).appendTo('head');
 
-    IITC.toolbox.addButton({
+    window.IITC.toolbox.addButton({
       label: 'Bookmark Sync',
       title: 'Sync bookmarks to/from Google Sheet',
       action: self.showSyncDialog
@@ -497,7 +589,9 @@ function wrapper(plugin_info, page) {
   };
 
   setup.info = plugin_info;
-  window.bootPlugins.push(setup);
+  window.bootPlugins = window.bootPlugins || [];
+  if (window.iitcLoaded) setup();
+  else window.bootPlugins.push(setup);
 }
 
 // --- IITC integration ---
